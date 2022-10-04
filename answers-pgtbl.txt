@@ -1,0 +1,6 @@
+1.  page 0包含程序段, 即initcode, page 2为用户栈, 
+    page 1被当作guard page使用，防止栈溢出, 没有PTE_U，因此不能在user mode中被读写.
+    
+2.  当srcva取值正常(即在进程的用户mem范围内), 而len取值非常大，大到srcva+len超过了uint64的最大值,
+    此时srcva+len的计算值为实际值-2^64, 这种情况可能前两个条件满足, 而不满足最后一个条件,
+    这样做可以防止恶意程序通过设计len值访问到没有权限的mem段.
