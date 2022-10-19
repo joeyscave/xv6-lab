@@ -14,52 +14,90 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
-struct run {
+struct run
+{
   struct run *next;
 };
 
-struct {
+struct kmem
+{
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+};
 
-void
-kinit()
+struct kmem kmems[NCPU];
+
+void kinit()
 {
-  initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  for (int i = 0; i < NCPU; i++)
+  {
+    initlock(&kmems[i].lock, "kmem_"); // TODO
+  }
+  freerange(end, (void *)PHYSTOP);
 }
 
-void
-freerange(void *pa_start, void *pa_end)
+// kfree exclusively used for specific cpu
+void cpukfree(void *pa, int cpuid)
 {
-  char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
-    kfree(p);
+  struct run *r;
+
+  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
+    panic("kfree");
+
+  // Fill with junk to catch dangling refs.
+  memset(pa, 1, PGSIZE);
+
+  r = (struct run *)pa;
+
+  acquire(&kmems[cpuid].lock);
+  r->next = kmems[cpuid].freelist;
+  kmems[cpuid].freelist = r;
+  release(&kmems[cpuid].lock);
 }
 
 // Free the page of physical memory pointed at by v,
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
-void
-kfree(void *pa)
+void kfree(void *pa)
+{
+  cpukfree(pa, cpuid());
+}
+
+// kalloc exclusively used for specific cpu
+void *
+cpukalloc(int cpuid)
 {
   struct run *r;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
-    panic("kfree");
+  acquire(&kmems[cpuid].lock);
+  r = kmems[cpuid].freelist;
+  if (r)
+  {
+    kmems[cpuid].freelist = r->next;
+    release(&kmems[cpuid].lock);
+  }
+  else
+  {
+    // steal memory from other CPU
+    release(&kmems[cpuid].lock);
+    for (int id = (cpuid + 1) % NCPU; id != cpuid; id = (id + 1) % NCPU)
+    {
+      acquire(&kmems[id].lock);
+      r = kmems[id].freelist;
+      if (r)
+      {
+        kmems[id].freelist = r->next;
+        release(&kmems[id].lock);
+        break;
+      }
+      release(&kmems[id].lock);
+    }
+  }
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
-
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  if (r)
+    memset((char *)r, 5, PGSIZE); // fill with junk
+  return (void *)r;
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -68,15 +106,20 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
-  struct run *r;
+  return cpukalloc(cpuid());
+}
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+void freerange(void *pa_start, void *pa_end)
+{
+  char *p;
+  p = (char *)PGROUNDUP((uint64)pa_start);
+  int j, npage = (int)((char *)pa_end - p) / PGSIZE / NCPU;
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+  for (int i = 0; i < NCPU - 1; i++)
+  {
+    for (j = 0; j < npage; p += PGSIZE, j++)
+      cpukfree(p, i);
+  }
+  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
+    cpukfree(p, NCPU - 1);
 }
